@@ -2,72 +2,146 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from collections import defaultdict
 import logging
-
-import requests
-import voluptuous as vol
+from typing import Any
 
 from homeassistant.components.sensor import (
-    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorDeviceClass,
     SensorEntity,
+    SensorStateClass,
 )
-from homeassistant.const import CONF_HOST, CONF_PORT
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import PlatformNotReady
-import homeassistant.helpers.config_validation as cv
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import (
+    UnitOfDataRate,
+    UnitOfElectricPotential,
+    UnitOfFrequency,
+    UnitOfInformation,
+    UnitOfPower,
+    UnitOfTemperature,
+)
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from homeassistant.util import Throttle
-from homeassistant.util.dt import utcnow
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from .const import DOMAIN
+from .coordinator import OpenHardwareMonitorCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-STATE_MIN_VALUE = "minimal_value"
-STATE_MAX_VALUE = "maximum_value"
-STATE_VALUE = "value"
-STATE_OBJECT = "object"
-CONF_INTERVAL = "interval"
-
-MIN_TIME_BETWEEN_UPDATES = timedelta(seconds=15)
-SCAN_INTERVAL = timedelta(seconds=30)
-RETRY_INTERVAL = timedelta(seconds=30)
-
 OHM_VALUE = "Value"
-OHM_MIN = "Min"
-OHM_MAX = "Max"
 OHM_CHILDREN = "Children"
 OHM_NAME = "Text"
 
-PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
-    {vol.Required(CONF_HOST): cv.string, vol.Optional(CONF_PORT, default=8085): cv.port}
-)
 
-
-def setup_platform(
+async def async_setup_entry(
     hass: HomeAssistant,
-    config: ConfigType,
-    add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the Open Hardware Monitor platform."""
-    data = OpenHardwareMonitorData(config, hass)
-    if data.data is None:
-        raise PlatformNotReady
-    add_entities(data.devices, True)
+    """Prepare sensor entities for OWM."""
+    coordinator: OpenHardwareMonitorCoordinator = hass.data[DOMAIN][
+        config_entry.entry_id
+    ]
+    entities: list[OpenHardwareMonitorDevice] = create_entities(coordinator)
+    async_add_entities(entities, update_before_add=True)
 
 
-class OpenHardwareMonitorDevice(SensorEntity):
+def create_entities(
+    coordinator: OpenHardwareMonitorCoordinator,
+) -> list[OpenHardwareMonitorDevice]:
+    """Create a list of sensor entities from current data update."""
+    data: dict[str, Any] | None = coordinator.data
+    if data is None:
+        return []
+
+    # Device name is the first
+    device_info = None
+    if data[OHM_CHILDREN] is not None and len(data[OHM_CHILDREN]) > 0:
+        machine_name = data[OHM_CHILDREN][0].get(OHM_NAME)
+        device_info = DeviceInfo(
+            name=machine_name, model=machine_name, identifiers={(DOMAIN, machine_name)}
+        )
+        _LOGGER.info("Set up OpenHardwareMonitor for %s", machine_name)
+    return parse_children(coordinator, data, [], [], [], defaultdict(int), device_info)
+
+
+def parse_children(coordinator, json, devices, path, names, namedict, device_info):
+    """Recursively loop through child objects, finding the values."""
+    result = devices.copy()
+
+    if json[OHM_CHILDREN]:
+        for child_index in range(len(json[OHM_CHILDREN])):
+            child_path = path.copy()
+            child_path.append(child_index)
+
+            child_names = names.copy()
+            if path:
+                child_names.append(json[OHM_NAME])
+
+            obj = json[OHM_CHILDREN][child_index]
+
+            added_devices = parse_children(
+                coordinator,
+                obj,
+                devices,
+                child_path,
+                child_names,
+                namedict,
+                device_info,
+            )
+
+            result = result + added_devices
+        return result
+
+    if json[OHM_VALUE].find(" ") == -1:
+        return result
+
+    split_value = json[OHM_VALUE].split(" ")
+    initial_value = split_value[0]
+    unit_of_measurement = split_value[1]
+    child_names = names.copy()
+    child_names.append(json[OHM_NAME])
+    # Prevent duplicate entity IDs by appending "2", "3", etc. for
+    # each duplicate found.
+    fullname = " ".join(child_names)
+    namedict[fullname] += 1
+    if namedict[fullname] > 1:
+        fullname += " " + str(namedict[fullname])
+
+    dev = OpenHardwareMonitorDevice(
+        coordinator, fullname, path, unit_of_measurement, device_info
+    )
+    _LOGGER.debug(
+        "[%s] - %s - %s %s",
+        fullname,
+        path,
+        initial_value,
+        dev.native_unit_of_measurement,
+    )
+
+    result.append(dev)
+    return result
+
+
+class OpenHardwareMonitorDevice(CoordinatorEntity, SensorEntity):
     """Device used to display information from OpenHardwareMonitor."""
 
-    def __init__(self, data, name, path, unit_of_measurement):
+    def __init__(self, coordinator, name, path, unit_of_measurement, device_info):
         """Initialize an OpenHardwareMonitor sensor."""
+        super().__init__(coordinator)
+        self.unique_id = name
         self._name = name
-        self._data = data
+        self._attr_state_class = SensorStateClass.MEASUREMENT
         self.path = path
         self.attributes = {}
+        unit_of_measurement = self._sanitize_unit(unit_of_measurement)
         self._unit_of_measurement = unit_of_measurement
-
+        self._attr_device_class = self._device_class_from_unit(unit_of_measurement)
+        # OWM shows its measurements with 1 decimal
+        self._attr_suggested_display_precision = 1
+        self._attr_device_info = device_info
         self.value = None
 
     @property
@@ -97,11 +171,14 @@ class OpenHardwareMonitorDevice(SensorEntity):
         """In some locales a decimal numbers uses ',' instead of '.'."""
         return string.replace(",", ".")
 
-    def update(self) -> None:
-        """Update the device from a new JSON object."""
-        self._data.update()
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        data = self.coordinator.data
+        if data is None:
+            return
 
-        array = self._data.data[OHM_CHILDREN]
+        array = data[OHM_CHILDREN]
         _attributes = {}
 
         for path_index, path_number in enumerate(self.path):
@@ -109,96 +186,58 @@ class OpenHardwareMonitorDevice(SensorEntity):
 
             if path_index == len(self.path) - 1:
                 self.value = self.parse_number(values[OHM_VALUE].split(" ")[0])
-                _attributes.update(
-                    {
-                        "name": values[OHM_NAME],
-                        STATE_MIN_VALUE: self.parse_number(
-                            values[OHM_MIN].split(" ")[0]
-                        ),
-                        STATE_MAX_VALUE: self.parse_number(
-                            values[OHM_MAX].split(" ")[0]
-                        ),
-                    }
-                )
-
+                _attributes.update({"name": values[OHM_NAME]})
                 self.attributes = _attributes
+                _LOGGER.debug("%s updated to %s", self.name, self.value)
+                self.async_write_ha_state()
                 return
             array = array[path_number][OHM_CHILDREN]
             _attributes.update({f"level_{path_index}": values[OHM_NAME]})
 
+    def _sanitize_unit(self, unit_of_measurement):
+        """Sanitize unit of measurement.
 
-class OpenHardwareMonitorData:
-    """Class used to pull data from OHM and create sensors."""
+        Some units in OWM don't quite match case to
+        HASS units so we prefer to convert them for
+        consistency.
+        """
+        if unit_of_measurement is None:
+            return None
 
-    def __init__(self, config, hass):
-        """Initialize the Open Hardware Monitor data-handler."""
-        self.data = None
-        self._config = config
-        self._hass = hass
-        self.devices = []
-        self.initialize(utcnow())
+        UNIT_MAP = {
+            "kb/s": UnitOfDataRate.KILOBYTES_PER_SECOND,
+            "mb/s": UnitOfDataRate.MEGABYTES_PER_SECOND,
+            "gb/s": UnitOfDataRate.GIGABYTES_PER_SECOND,
+            "hz": UnitOfFrequency.HERTZ,
+            "khz": UnitOfFrequency.KILOHERTZ,
+            "mhz": UnitOfFrequency.MEGAHERTZ,
+            "ghz": UnitOfFrequency.GIGAHERTZ,
+            "°c": UnitOfTemperature.CELSIUS,
+            "°f": UnitOfTemperature.FAHRENHEIT,
+            "w": UnitOfPower.WATT,
+            "gb": UnitOfInformation.GIGABYTES,
+            "mb": UnitOfInformation.MEGABYTES,
+            "kb": UnitOfInformation.KILOBYTES,
+            "b": UnitOfInformation.BYTES,
+            "v": UnitOfElectricPotential.VOLT,
+        }
 
-    @Throttle(MIN_TIME_BETWEEN_UPDATES)
-    def update(self):
-        """Hit by the timer with the configured interval."""
-        if self.data is None:
-            self.initialize(utcnow())
-        else:
-            self.refresh()
+        unit = unit_of_measurement.lower()
+        if unit in UNIT_MAP:
+            return UNIT_MAP[unit]
+        return unit_of_measurement
 
-    def refresh(self):
-        """Download and parse JSON from OHM."""
-        data_url = (
-            f"http://{self._config.get(CONF_HOST)}:"
-            f"{self._config.get(CONF_PORT)}/data.json"
-        )
-
-        try:
-            response = requests.get(data_url, timeout=30)
-            self.data = response.json()
-        except requests.exceptions.ConnectionError:
-            _LOGGER.debug("ConnectionError: Is OpenHardwareMonitor running?")
-
-    def initialize(self, now):
-        """Parse of the sensors and adding of devices."""
-        self.refresh()
-
-        if self.data is None:
-            return
-
-        self.devices = self.parse_children(self.data, [], [], [])
-
-    def parse_children(self, json, devices, path, names):
-        """Recursively loop through child objects, finding the values."""
-        result = devices.copy()
-
-        if json[OHM_CHILDREN]:
-            for child_index in range(len(json[OHM_CHILDREN])):
-                child_path = path.copy()
-                child_path.append(child_index)
-
-                child_names = names.copy()
-                if path:
-                    child_names.append(json[OHM_NAME])
-
-                obj = json[OHM_CHILDREN][child_index]
-
-                added_devices = self.parse_children(
-                    obj, devices, child_path, child_names
-                )
-
-                result = result + added_devices
-            return result
-
-        if json[OHM_VALUE].find(" ") == -1:
-            return result
-
-        unit_of_measurement = json[OHM_VALUE].split(" ")[1]
-        child_names = names.copy()
-        child_names.append(json[OHM_NAME])
-        fullname = " ".join(child_names)
-
-        dev = OpenHardwareMonitorDevice(self, fullname, path, unit_of_measurement)
-
-        result.append(dev)
-        return result
+    def _device_class_from_unit(self, unit_of_measurement):
+        if unit_of_measurement in ("°C", "°F"):
+            return SensorDeviceClass.TEMPERATURE
+        if unit_of_measurement in ("W"):
+            return SensorDeviceClass.POWER
+        if unit_of_measurement in ("V"):
+            return SensorDeviceClass.VOLTAGE
+        if unit_of_measurement in ("KB/s"):
+            return SensorDeviceClass.DATA_RATE
+        if unit_of_measurement in ("GB", "MB", "KB"):
+            return SensorDeviceClass.DATA_SIZE
+        if unit_of_measurement in ("MHz", "GHz", "KHz", "Hz"):
+            return SensorDeviceClass.FREQUENCY
+        return None
